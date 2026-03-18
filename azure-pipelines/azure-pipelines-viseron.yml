@@ -1,0 +1,109 @@
+parameters:
+  - name: noCache
+    displayName: "Build without cache"
+    type: boolean
+    default: false
+
+trigger:
+  branches:
+    include:
+      - dev
+  tags:
+    include:
+      - "*"
+  paths:
+    include:
+      - viseron/*
+      - rootfs/*
+    exclude:
+      - requirements.txt
+pr: none
+
+pool:
+  vmImage: "ubuntu-latest"
+
+resources:
+  pipelines:
+    - pipeline: viseronFFmpeg
+      source: "Viseron FFmpeg"
+      trigger:
+        branches:
+          - dev
+    - pipeline: viseronOpenCV
+      source: "Viseron OpenCV"
+      trigger:
+        branches:
+          - dev
+    - pipeline: viseronWheels
+      source: "Viseron Wheels"
+      trigger:
+        branches:
+          - dev
+    - pipeline: viseronBase
+      source: "Viseron Base"
+      trigger:
+        branches:
+          - dev
+
+stages:
+  - stage: Build
+    jobs:
+      - template: templates/build.yaml
+        parameters:
+          image: viseron
+          release: true
+          noCache: ${{ parameters.noCache }}
+
+  - stage: "Publish"
+    jobs:
+      - job: "ReleaseViseron"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - template: templates/release_version.yaml
+            parameters:
+              release: true
+          - task: Docker@2
+            displayName: Login to Docker Hub
+            inputs:
+              command: login
+              containerRegistry: "Docker Hub"
+
+          - template: templates/cleanup.yaml
+
+          - script: |
+              set -e
+              export DOCKER_CLI_EXPERIMENTAL=enabled
+
+              function create_manifest() {
+                local release_version=$1
+
+                docker buildx imagetools create \
+                  --debug \
+                  --tag roflcoopter/viseron:${release_version} \
+                  roflcoopter/amd64-viseron:${release_version} \
+                  roflcoopter/rpi3-viseron:${release_version} \
+                  roflcoopter/aarch64-viseron:${release_version}
+
+                docker manifest inspect roflcoopter/viseron:${release_version}
+              }
+
+              echo "Pulling architecture-specific images for version $(viseronVersion)"
+              docker pull roflcoopter/amd64-viseron:$(viseronVersion)
+              docker pull roflcoopter/rpi3-viseron:$(viseronVersion)
+              docker pull roflcoopter/aarch64-viseron:$(viseronVersion)
+
+              # Create version tag
+              echo "Creating and pushing multi-arch manifest for $(viseronVersion)"
+              create_manifest $(viseronVersion)
+              if [ $(latestRelease) = true ] ; then
+                echo "Tagging as latest"
+                create_manifest "latest"
+              fi
+            displayName: "Create multi-arch image"
+          - task: Docker@2
+            displayName: Logoff Docker Hub
+            inputs:
+              command: logout
+              containerRegistry: "Docker Hub"
+              condition: always()

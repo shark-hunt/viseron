@@ -1,0 +1,436 @@
+"""MQTT interface."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Any
+
+import paho.mqtt.client as mqtt
+import voluptuous as vol
+from paho.mqtt.enums import MQTTErrorCode
+
+from viseron.components.nvr.toggle import ManualRecordingToggle
+from viseron.const import (
+    EVENT_ENTITY_ADDED,
+    EVENT_STATE_CHANGED,
+    VISERON_SIGNAL_SHUTDOWN,
+)
+from viseron.events import EventEmptyData
+from viseron.helpers.validators import CoerceNoneToDict, Maybe
+from viseron.watchdog.thread_watchdog import RestartableThread
+
+from .const import (
+    COMPONENT,
+    CONFIG_BASE_TOPIC,
+    CONFIG_BROKER,
+    CONFIG_CLIENT_ID,
+    CONFIG_DISCOVERY_PREFIX,
+    CONFIG_HOME_ASSISTANT,
+    CONFIG_LAST_WILL_TOPIC,
+    CONFIG_PASSWORD,
+    CONFIG_PORT,
+    CONFIG_PUBLISH_HA_CONFIG_ON_RECONNECT,
+    CONFIG_PUBLISH_STATES_ON_RECONNECT,
+    CONFIG_RETAIN_CONFIG,
+    CONFIG_USERNAME,
+    DEFAULT_BASE_TOPIC,
+    DEFAULT_CLIENT_ID,
+    DEFAULT_DISCOVERY_PREFIX,
+    DEFAULT_LAST_WILL_TOPIC,
+    DEFAULT_PASSWORD,
+    DEFAULT_PORT,
+    DEFAULT_PUBLISH_HA_CONFIG_ON_RECONNECT,
+    DEFAULT_PUBLISH_STATES_ON_RECONNECT,
+    DEFAULT_RETAIN_CONFIG,
+    DEFAULT_USERNAME,
+    DESC_BASE_TOPIC,
+    DESC_BROKER,
+    DESC_CLIENT_ID,
+    DESC_COMPONENT,
+    DESC_DISCOVERY_PREFIX,
+    DESC_HOME_ASSISTANT,
+    DESC_LAST_WILL_TOPIC,
+    DESC_PASSWORD,
+    DESC_PORT,
+    DESC_PUBLISH_HA_CONFIG_ON_RECONNECT,
+    DESC_PUBLISH_STATES_ON_RECONNECT,
+    DESC_RETAIN_CONFIG,
+    DESC_USERNAME,
+    EVENT_MQTT_BROKER_RECONNECT,
+    EVENT_MQTT_ENTITY_ADDED,
+    INCLUSION_GROUP_AUTHENTICATION,
+    MESSAGE_AUTHENTICATION,
+    MQTT_CLIENT_CONNECTION_OFFLINE,
+    MQTT_CLIENT_CONNECTION_ONLINE,
+    MQTT_RC,
+)
+from .entity.binary_sensor import BinarySensorMQTTEntity
+from .entity.image import ImageMQTTEntity
+from .entity.sensor import SensorMQTTEntity
+from .entity.toggle import ManualRecordingToggleMQTTEntity, ToggleMQTTEntity
+from .event import EventMQTTEntityAddedData
+from .helpers import PublishPayload, SubscribeTopic
+from .homeassistant import HassMQTTInterface
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from viseron import Event, Viseron
+    from viseron.helpers.entity import Entity
+    from viseron.states import EventEntityAddedData
+
+    from .entity import MQTTEntity
+
+LOGGER = logging.getLogger(__name__)
+
+
+HOME_ASSISTANT_SCHEMA = vol.Schema(
+    {
+        vol.Optional(
+            CONFIG_DISCOVERY_PREFIX,
+            default=DEFAULT_DISCOVERY_PREFIX,
+            description=DESC_DISCOVERY_PREFIX,
+        ): str,
+        vol.Optional(
+            CONFIG_RETAIN_CONFIG,
+            default=DEFAULT_RETAIN_CONFIG,
+            description=DESC_RETAIN_CONFIG,
+        ): bool,
+        vol.Optional(
+            CONFIG_PUBLISH_HA_CONFIG_ON_RECONNECT,
+            default=DEFAULT_PUBLISH_HA_CONFIG_ON_RECONNECT,
+            description=DESC_PUBLISH_HA_CONFIG_ON_RECONNECT,
+        ): bool,
+    }
+)
+
+CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Required(COMPONENT, description=DESC_COMPONENT): vol.Schema(
+            {
+                vol.Required(CONFIG_BROKER, description=DESC_BROKER): str,
+                vol.Optional(
+                    CONFIG_PORT, default=DEFAULT_PORT, description=DESC_PORT
+                ): int,
+                vol.Inclusive(
+                    CONFIG_USERNAME,
+                    INCLUSION_GROUP_AUTHENTICATION,
+                    default=DEFAULT_USERNAME,
+                    description=DESC_USERNAME,
+                    msg=MESSAGE_AUTHENTICATION,
+                ): Maybe(str),
+                vol.Inclusive(
+                    CONFIG_PASSWORD,
+                    INCLUSION_GROUP_AUTHENTICATION,
+                    default=DEFAULT_PASSWORD,
+                    description=DESC_PASSWORD,
+                    msg=MESSAGE_AUTHENTICATION,
+                ): Maybe(str),
+                vol.Optional(
+                    CONFIG_CLIENT_ID,
+                    default=DEFAULT_CLIENT_ID,
+                    description=DESC_CLIENT_ID,
+                ): Maybe(str),
+                vol.Optional(
+                    CONFIG_BASE_TOPIC,
+                    default=DEFAULT_BASE_TOPIC,
+                    description=DESC_BASE_TOPIC,
+                ): Maybe(str),
+                vol.Optional(
+                    CONFIG_LAST_WILL_TOPIC,
+                    default=DEFAULT_LAST_WILL_TOPIC,
+                    description=DESC_LAST_WILL_TOPIC,
+                ): Maybe(str),
+                vol.Optional(
+                    CONFIG_PUBLISH_STATES_ON_RECONNECT,
+                    default=DEFAULT_PUBLISH_STATES_ON_RECONNECT,
+                    description=DESC_PUBLISH_STATES_ON_RECONNECT,
+                ): bool,
+                vol.Optional(
+                    CONFIG_HOME_ASSISTANT,
+                    description=DESC_HOME_ASSISTANT,
+                ): vol.All(CoerceNoneToDict(), HOME_ASSISTANT_SCHEMA),
+            },
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+ENTITY_MAP: dict[str, type[MQTTEntity]] = {
+    "binary_sensor": BinarySensorMQTTEntity,
+    "image": ImageMQTTEntity,
+    "sensor": SensorMQTTEntity,
+    "toggle": ToggleMQTTEntity,
+}
+
+ENTITY_OVERRIDES: dict[type, type[MQTTEntity]] = {
+    ManualRecordingToggle: ManualRecordingToggleMQTTEntity,
+}
+
+
+def setup(vis: Viseron, config: dict[str, Any]) -> bool:
+    """Set up the mqtt component."""
+    config = config[COMPONENT]
+    mqtt_client = MQTT(vis, config)
+    vis.data[COMPONENT] = mqtt_client
+    mqtt_client.connect()
+
+    if config.get(CONFIG_HOME_ASSISTANT, None):
+        vis.data[COMPONENT].hass_interface = HassMQTTInterface(vis, config)
+
+    return True
+
+
+def unload(vis: Viseron) -> None:
+    """Unload the mqtt component."""
+    if COMPONENT in vis.data:
+        mqtt_client = vis.data[COMPONENT]
+        mqtt_client.stop()
+        if mqtt_client.hass_interface:
+            mqtt_client.hass_interface.unload()
+        del vis.data[COMPONENT]
+
+
+class MQTT:
+    """MQTT interface."""
+
+    def __init__(self, vis: Viseron, config: dict[str, Any]) -> None:
+        self._vis = vis
+        self._config = config
+
+        self._client = mqtt.Client(client_id=self._config[CONFIG_CLIENT_ID])
+        self._publish_queue: Queue = Queue(maxsize=1000)
+        self._subscriptions: dict[str, list[Callable]] = {}
+
+        self._connected = False
+        self._reconnect = False
+        self._kill_received = False
+
+        self._publisher_thread: RestartableThread | None = None
+
+        self._entity_creation_lock = threading.Lock()
+        self._entities: dict[str, MQTTEntity] = {}
+
+        self._event_listeners = []
+        self._event_listeners.append(
+            vis.register_signal_handler(VISERON_SIGNAL_SHUTDOWN, self.stop)
+        )
+
+        self.hass_interface: HassMQTTInterface | None = None
+
+    @property
+    def base_topic(self) -> str:
+        """Return base topic."""
+        if self._config[CONFIG_BASE_TOPIC]:
+            return self._config[CONFIG_BASE_TOPIC]
+        return self._config[CONFIG_CLIENT_ID]
+
+    @property
+    def lwt_topic(self) -> str:
+        """Return last will topic."""
+        if self._config[CONFIG_LAST_WILL_TOPIC]:
+            return self._config[CONFIG_LAST_WILL_TOPIC]
+        return f"{self.base_topic}/lwt"
+
+    @property
+    def client_connection_topic(self) -> str:
+        """Return client connection topic."""
+        return f"{self.base_topic}/state"
+
+    def create_entity(self, entity: Entity) -> None:
+        """Create entity in Home Assistant."""
+        with self._entity_creation_lock:
+            if entity.entity_id in self._entities:
+                LOGGER.debug(f"Entity {entity.entity_id} has already been added")
+                return
+
+            if (entity_class := ENTITY_OVERRIDES.get(type(entity))) or (
+                entity_class := ENTITY_MAP.get(entity.domain)
+            ):
+                mqtt_entity = entity_class(self._vis, self._config, entity)
+            else:
+                LOGGER.debug(f"Unsupported domain encountered: {entity.domain}")
+                return
+
+            self._entities[entity.entity_id] = mqtt_entity
+            self._vis.dispatch_event(
+                EVENT_MQTT_ENTITY_ADDED,
+                EventMQTTEntityAddedData(mqtt_entity),
+                store=False,
+            )
+
+    def create_entities(self, entities: dict[str, Entity]) -> None:
+        """Create entities in Home Assistant."""
+        for entity in entities.values():
+            self.create_entity(entity)
+
+    def entity_added(self, event_data: Event) -> None:
+        """Add entity to Home Assistant when its added to Viseron."""
+        entity_added_data: EventEntityAddedData = event_data.data
+        self.create_entity(entity_added_data.entity)
+
+    def get_entities(self) -> dict[str, MQTTEntity]:
+        """Return registered MQTT entities."""
+        return self._entities
+
+    def on_connect(self, _client, _userdata, _flags, returncode) -> None:
+        """On established MQTT connection."""
+        LOGGER.debug(f"MQTT connected with returncode {returncode!s}")
+        if returncode != 0:
+            LOGGER.error(
+                f"Could not connect to broker. Returncode: {returncode}: "
+                f"{MQTT_RC.get(returncode, 'Unknown error')}"
+            )
+            return
+        self._connected = True
+
+        # Send initial alive message
+        self.publish(PublishPayload(topic=self.lwt_topic, payload="alive", retain=True))
+        self.publish(
+            PublishPayload(
+                topic=self.client_connection_topic,
+                payload=MQTT_CLIENT_CONNECTION_ONLINE,
+                retain=True,
+            )
+        )
+
+        if self._reconnect:
+            self.on_reconnect()
+            return
+
+        self._event_listeners.append(
+            self._vis.listen_event(EVENT_ENTITY_ADDED, self.entity_added)
+        )
+        self.create_entities(self._vis.get_entities())
+        self._event_listeners.append(
+            self._vis.listen_event(EVENT_STATE_CHANGED, self.state_changed)
+        )
+
+    def on_reconnect(self) -> None:
+        """Handle broker reconnect."""
+        LOGGER.debug("Reconnected to MQTT broker, re-subscribing to topics")
+        self._reconnect = False
+        # Re-subscribe to all topics
+        for topic in self._subscriptions:
+            LOGGER.debug(f"Re-subscribing to topic {topic}")
+            self._client.subscribe(topic)
+
+        # Re-publish all states
+        if self._config[CONFIG_PUBLISH_STATES_ON_RECONNECT]:
+            for entity in self._entities.values():
+                entity.publish_state()
+        self._vis.dispatch_event(EVENT_MQTT_BROKER_RECONNECT, EventEmptyData())
+
+    def on_disconnect(self, _client, _userdata, returncode) -> None:
+        """On MQTT disconnection."""
+        if returncode != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            LOGGER.warning(
+                f"MQTT disconnected with returncode {returncode!s}({returncode})"
+            )
+        if self._connected:
+            self._reconnect = True
+            self._connected = False
+
+    def on_message(self, _client, _userdata, msg) -> None:
+        """On message received."""
+        LOGGER.debug(
+            f"Message received on topic {msg.topic}, message {msg.payload.decode()!s}"
+        )
+        for callback in self._subscriptions[msg.topic]:
+            # Run callback in thread to not block the message queue
+            RestartableThread(
+                name=f"mqtt_callback.{callback}",
+                target=callback,
+                args=(msg,),
+                daemon=True,
+                register=False,
+            ).start()
+
+    def connect(self) -> None:
+        """Connect to broker."""
+        self._client.on_connect = self.on_connect
+        self._client.on_disconnect = self.on_disconnect
+        self._client.on_message = self.on_message
+        self._client.enable_logger(logger=logging.getLogger(f"{__name__}.client"))
+        logging.getLogger(f"{__name__}.client").setLevel(logging.INFO)
+        if self._config[CONFIG_USERNAME]:
+            self._client.username_pw_set(
+                self._config[CONFIG_USERNAME], self._config[CONFIG_PASSWORD]
+            )
+
+        self._publisher_thread = RestartableThread(
+            name=f"{__name__}.publisher",
+            target=self.publisher,
+            daemon=True,
+            register=True,
+        )
+        self._publisher_thread.start()
+
+        # Set a Last Will message
+        self._client.will_set(self.lwt_topic, payload="dead", retain=True)
+        self._client.connect(self._config[CONFIG_BROKER], self._config[CONFIG_PORT], 10)
+
+        # Start threaded loop to read/publish messages
+        self._client.loop_start()
+
+    def subscribe(self, subscription: SubscribeTopic) -> None:
+        """Subscribe to a topic."""
+        if subscription.topic not in self._subscriptions:
+            self._client.subscribe(subscription.topic)
+
+        LOGGER.debug(f"Subscribing to topic {subscription.topic}")
+        self._subscriptions.setdefault(subscription.topic, [])
+        self._subscriptions[subscription.topic].append(subscription.callback)
+
+    def publish(self, payload: PublishPayload) -> None:
+        """Put payload in publish queue."""
+        self._publish_queue.put(payload)
+
+    def publisher(self) -> None:
+        """Publish thread."""
+        while not self._kill_received:
+            try:
+                message: PublishPayload = self._publish_queue.get(timeout=1)
+            except Empty:
+                continue
+
+            self._client.publish(
+                message.topic,
+                payload=message.payload,
+                retain=message.retain,
+            )
+
+    def state_changed(self, event_data: Event) -> None:
+        """Relay entity state change to MQTT."""
+        with self._entity_creation_lock:
+            entity_id = event_data.data.entity_id
+
+            if entity_id not in self._entities:
+                LOGGER.error(f"State change triggered for missing entity {entity_id}")
+                return
+
+            self._entities[entity_id].publish_state()
+
+    def stop(self) -> None:
+        """Stop mqtt client."""
+        LOGGER.debug("Stopping MQTT client")
+        for unsubscribe in self._event_listeners:
+            unsubscribe()
+
+        # Publish using client directly so we are sure its published
+        self._client.publish(
+            topic=self.client_connection_topic,
+            payload=MQTT_CLIENT_CONNECTION_OFFLINE,
+            retain=True,
+        )
+
+        self._kill_received = True
+        if self._publisher_thread:
+            self._publisher_thread.stop()
+            self._publisher_thread.join()
+
+        self._client.disconnect()
+        self._client.loop_stop()

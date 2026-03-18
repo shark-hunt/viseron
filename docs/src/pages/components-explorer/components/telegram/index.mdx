@@ -1,0 +1,69 @@
+import ComponentConfiguration from "@site/src/pages/components-explorer/_components/ComponentConfiguration";
+import ComponentHeader from "@site/src/pages/components-explorer/_components/ComponentHeader";
+import ComponentTroubleshooting from "@site/src/pages/components-explorer/_components/ComponentTroubleshooting";
+
+import ComponentMetadata from "./_meta";
+import config from "./config.json";
+
+<ComponentHeader meta={ComponentMetadata} />
+
+The telegram component can do two things.
+First, it can send detection videos (and thumbnails) to a chat when a detection occurs.
+Second, it can be used to control the [PTZ component](/components-explorer/components/ptz) from the chat, with commands like `/left`, `/right`, etc.
+
+## Configuration
+
+<details>
+  <summary>Configuration example</summary>
+
+```yaml title="/config/config.yaml"
+telegram:
+  telegram_bot_token: <bot_token_from_BotFather>
+  telegram_chat_ids:
+    - <your_chat_id>
+  detection_label: person
+  send_detection_thumbnail: true
+  send_detection_video: true
+  send_detection_message: false
+  cameras:
+    camera_1:
+    camera_2:
+```
+
+</details>
+
+<ComponentConfiguration meta={ComponentMetadata} config={config} />
+
+## How to create a bot and get your chat ID:
+
+### Create a bot
+
+- In Telegram, open @BotFather.
+- Send `/newbot`, choose a name and a unique username.
+- Copy the token it returns (use this as `telegram_bot_token`).
+
+### Start a conversation
+
+- Private chat: open your bot and press Start, then send any message.
+- Group: add your bot to the group and send a message in the group.
+  - If the bot does not receive group messages, disable privacy via @BotFather: /setprivacy → select your bot → Disable.
+
+### Find your chat ID
+
+You can get your `chat_id` by sending a message to the [GetIDs bot](https://t.me/getidsbot).
+
+### Configure Viseron
+
+- Put the numeric ID(s) in `telegram_chat_ids`.
+- You can list multiple IDs to notify several chats.
+
+For more thorough instructions, see the Home Assistant Telegram docs:
+https://www.home-assistant.io/integrations/telegram/
+
+## Available commands
+
+To find the available commands you can use, send `/help` to your bot in Telegram.
+
+## Troubleshooting
+
+<ComponentTroubleshooting meta={ComponentMetadata} />

@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "types": [
+      "vite/client",
+      "vite-plugin-svgr/client",
+      "vitest/globals",
+      "node"
+    ],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "baseUrl": "src",
+    "paths": {
+      "tests/*": ["../tests/*"],
+      "e2e/*": ["../e2e/*"]
+    }
+  },
+  "include": ["src", "tests", "e2e", "playwright.config.ts", "eslint-rules"]
+}

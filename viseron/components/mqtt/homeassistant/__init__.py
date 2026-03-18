@@ -1,0 +1,102 @@
+"""Home Assistant MQTT integration."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import TYPE_CHECKING
+
+from viseron.components.mqtt.const import (
+    COMPONENT,
+    EVENT_MQTT_BROKER_RECONNECT,
+    EVENT_MQTT_ENTITY_ADDED,
+)
+from viseron.components.mqtt.event import EventMQTTEntityAddedData
+from viseron.events import EventEmptyData
+
+from .binary_sensor import HassMQTTBinarySensor
+from .camera import HassMQTTCamera
+from .entity import HassMQTTEntity
+from .sensor import HassMQTTSensor
+from .switch import HassMQTTSwitch
+
+if TYPE_CHECKING:
+    from viseron import Event, Viseron
+    from viseron.components.mqtt.entity import MQTTEntity
+
+LOGGER = logging.getLogger(__name__)
+
+DOMAIN_MAP = {
+    "binary_sensor": HassMQTTBinarySensor,
+    "image": HassMQTTCamera,
+    "sensor": HassMQTTSensor,
+    "toggle": HassMQTTSwitch,
+}
+
+
+class HassMQTTInterface:
+    """MQTT interface to Home Assistant."""
+
+    def __init__(self, vis: Viseron, config) -> None:
+        self._vis = vis
+        self._config = config
+
+        self._mqtt = vis.data[COMPONENT]
+
+        self._hass_entity_creation_lock = threading.Lock()
+        self._hass_entities: dict[str, HassMQTTEntity] = {}
+        self._event_listeners = []
+        self._event_listeners.append(
+            vis.listen_event(EVENT_MQTT_ENTITY_ADDED, self.mqtt_entity_added)
+        )
+        self._event_listeners.append(
+            vis.listen_event(EVENT_MQTT_BROKER_RECONNECT, self.broker_reconnect)
+        )
+
+        self.create_hass_entities(self._mqtt.get_entities())
+
+    def create_hass_entity(self, mqtt_entity: MQTTEntity) -> None:
+        """Create entity in Home Assistant."""
+        with self._hass_entity_creation_lock:
+            if mqtt_entity.entity.entity_id in self._hass_entities:
+                LOGGER.debug(
+                    f"Entity {mqtt_entity.entity.entity_id} "
+                    "has already been added to Home Assistant"
+                )
+                return
+
+            if entity_class := DOMAIN_MAP.get(mqtt_entity.entity.domain):
+                hass_entity: HassMQTTEntity = entity_class(
+                    self._vis, self._config, mqtt_entity
+                )
+            else:
+                LOGGER.debug(
+                    f"Unsupported domain encountered: {mqtt_entity.entity.domain}"
+                )
+                return
+
+            hass_entity.create()
+            self._hass_entities[mqtt_entity.entity.entity_id] = hass_entity
+
+    def create_hass_entities(self, entities) -> None:
+        """Create entities in Home Assistant."""
+        for entity in entities.values():
+            self.create_hass_entity(entity)
+
+    def mqtt_entity_added(self, event_data: Event) -> None:
+        """Add entity to Home Assistant when its added to Viseron."""
+        entity_added_data: EventMQTTEntityAddedData = event_data.data
+        self.create_hass_entity(entity_added_data.mqtt_entity)
+
+    def broker_reconnect(self, _event_data: Event[EventEmptyData]) -> None:
+        """Recreate all entities on broker reconnect."""
+        LOGGER.debug("Recreating all Home Assistant MQTT entities")
+        with self._hass_entity_creation_lock:
+            for entity in self._hass_entities.values():
+                entity.create()
+
+    def unload(self) -> None:
+        """Unload Home Assistant MQTT interface."""
+        for unsubscribe in self._event_listeners:
+            unsubscribe()
+        self._event_listeners = []
